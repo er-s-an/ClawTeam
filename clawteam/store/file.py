@@ -93,10 +93,11 @@ class FileTaskStore(BaseTaskStore):
             blocked_by=blocked_by or [],
             metadata=metadata or {},
         )
-        self._validate_blocked_by_unlocked(task.id, task.blocked_by)
-        if task.blocked_by:
-            task.status = TaskStatus.blocked
         with self._write_lock():
+            self._validate_blocked_by_unlocked(task.id, task.blocked_by)
+            task.blocked_by = self._unresolved_dependencies_unlocked(task.blocked_by)
+            if task.blocked_by:
+                task.status = TaskStatus.blocked
             self._save_unlocked(task)
         try:
             from clawteam.team.redis_wakeup import publish_wakeup, team_channel
@@ -193,7 +194,7 @@ class FileTaskStore(BaseTaskStore):
                     if b not in proposed_blocked_by:
                         proposed_blocked_by.append(b)
                 self._validate_blocked_by_unlocked(task.id, proposed_blocked_by)
-                task.blocked_by = proposed_blocked_by
+                task.blocked_by = self._unresolved_dependencies_unlocked(proposed_blocked_by)
                 if task.blocked_by and task.status == TaskStatus.pending:
                     task.status = TaskStatus.blocked
             if metadata:
@@ -312,6 +313,16 @@ class FileTaskStore(BaseTaskStore):
             }
             tasks.sort(key=lambda task: (priority_order.get(task.priority, 2), task.created_at, task.id))
         return tasks
+
+    def _unresolved_dependencies_unlocked(self, blocked_by: list[str]) -> list[str]:
+        # Completion only resolves dependents that already exist. A dependency
+        # attached later must be checked while holding the same write lock.
+        unresolved = []
+        for task_id in blocked_by:
+            dependency = self._get_unlocked(task_id)
+            if dependency is None or dependency.status != TaskStatus.completed:
+                unresolved.append(task_id)
+        return unresolved
 
     def _validate_blocked_by_unlocked(self, task_id: str, blocked_by: list[str]) -> None:
         if task_id in blocked_by:
